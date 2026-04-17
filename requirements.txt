@@ -10,4 +10,5 @@ charset-normalizer
 #mistree==1.2.1
 pytest
 sniffio
-mistree @ git+https://github.com/meyerls/mistree.git
+# mistree @ git+https://github.com/meyerls/mistree.git
+
