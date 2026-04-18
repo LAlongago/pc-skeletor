@@ -3,9 +3,12 @@
 """
 Skeletonize Pointcept-exported point clouds with pc-skeletor.
 
-This script assumes Pointcept part-segmentation PLY exports encode semantic
-labels as RGB colors. In the default fallback mode, each unique RGB triplet is
-treated as one pseudo-instance and skeletonized independently with LBC.
+Preferred usage for Pointcept part segmentation is:
+    --coord-npy <coord.npy> --pred-npy <sample_pred.npy>
+
+In that mode, the script exports one skeleton per predicted label and also one
+full skeleton for the entire point cloud. A legacy PLY mode is kept as a
+fallback for color-based grouping.
 """
 
 from __future__ import annotations
@@ -28,22 +31,83 @@ if str(REPO_ROOT) not in sys.path:
 
 RgbTuple = Tuple[int, int, int]
 
+PALETTE = np.array(
+    [
+        [230, 25, 75],
+        [60, 180, 75],
+        [255, 225, 25],
+        [0, 130, 200],
+        [245, 130, 48],
+        [145, 30, 180],
+        [70, 240, 240],
+        [240, 50, 230],
+        [210, 245, 60],
+        [250, 190, 190],
+        [0, 128, 128],
+        [230, 190, 255],
+        [170, 110, 40],
+        [255, 250, 200],
+        [128, 0, 0],
+        [170, 255, 195],
+        [128, 128, 0],
+        [255, 215, 180],
+        [0, 0, 128],
+        [128, 128, 128],
+        [255, 99, 71],
+        [154, 205, 50],
+        [30, 144, 255],
+        [255, 140, 0],
+        [186, 85, 211],
+        [0, 206, 209],
+        [255, 20, 147],
+        [124, 252, 0],
+        [255, 182, 193],
+        [32, 178, 170],
+        [221, 160, 221],
+        [160, 82, 45],
+        [255, 239, 213],
+        [139, 0, 0],
+        [127, 255, 212],
+        [85, 107, 47],
+    ],
+    dtype=np.uint8,
+)
+
+IGNORE_COLOR = np.array([80, 80, 80], dtype=np.uint8)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Skeletonize a Pointcept-exported prediction PLY. By default each "
-            "unique RGB color is treated as one pseudo-instance."
+            "Skeletonize Pointcept outputs. Preferred mode uses coord.npy and "
+            "pred.npy to generate one skeleton per label plus a full skeleton."
         )
     )
-    parser.add_argument("--input-ply", type=Path, required=True, help="Input Pointcept PLY file.")
+    parser.add_argument(
+        "--coord-npy",
+        type=Path,
+        default=None,
+        help="Pointcept coord.npy for the sample.",
+    )
+    parser.add_argument(
+        "--pred-npy",
+        type=Path,
+        default=None,
+        help="Pointcept predicted label file, e.g. 8_pred.npy.",
+    )
+    parser.add_argument(
+        "--input-ply",
+        type=Path,
+        default=None,
+        help="Fallback input PLY for color-based grouping.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for skeleton outputs.")
     parser.add_argument(
-        "--instance-mode",
+        "--group-mode",
         type=str,
-        choices=("color_label", "external_instance"),
-        default="color_label",
-        help="How to split the input point cloud into instances.",
+        choices=("label", "color_label", "external_instance"),
+        default="label",
+        help="How to split the point cloud into per-group skeletons.",
     )
     parser.add_argument(
         "--instance-file",
@@ -59,7 +123,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=("lbc", "slbc"),
         default="lbc",
-        help="Whole-point-cloud skeletonization method. Instance skeletons always use LBC.",
+        help="Whole-point-cloud skeletonization method. Per-group skeletons always use LBC.",
     )
     parser.add_argument(
         "--down-sample",
@@ -71,16 +135,26 @@ def parse_args() -> argparse.Namespace:
         "--min-points",
         type=int,
         default=32,
-        help="Skip instances with fewer than this many points.",
+        help="Skip groups with fewer than this many points.",
+    )
+    parser.add_argument(
+        "--trunk-labels",
+        nargs="*",
+        type=int,
+        default=None,
+        help="Optional label ids for full-cloud SLBC when labels are available.",
     )
     parser.add_argument(
         "--trunk-colors",
         nargs="*",
         default=None,
-        help=(
-            "Optional RGB triplets such as 230,25,75 60,180,75 for whole-cloud "
-            "SLBC. If omitted, the largest color group is used as trunk."
-        ),
+        help="Optional RGB triplets such as 230,25,75 for full-cloud SLBC in color mode.",
+    )
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=36,
+        help="Number of semantic classes used for pseudo-color rendering in label mode.",
     )
     parser.add_argument(
         "--verbose",
@@ -98,6 +172,24 @@ def parse_rgb_triplet(value: str) -> RgbTuple:
     if any(channel < 0 or channel > 255 for channel in rgb):
         raise ValueError(f"RGB values must be in [0, 255], got: {value}")
     return rgb  # type: ignore[return-value]
+
+
+def ensure_palette(num_classes: int) -> np.ndarray:
+    if num_classes <= len(PALETTE):
+        return PALETTE[:num_classes]
+    repeats = (num_classes + len(PALETTE) - 1) // len(PALETTE)
+    return np.tile(PALETTE, (repeats, 1))[:num_classes]
+
+
+def labels_to_color(labels: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    labels = labels.reshape(-1).astype(np.int64)
+    colors = np.empty((labels.shape[0], 3), dtype=np.uint8)
+    ignore_mask = (labels < 0) | (labels >= len(palette))
+    if np.any(~ignore_mask):
+        colors[~ignore_mask] = palette[labels[~ignore_mask]]
+    if np.any(ignore_mask):
+        colors[ignore_mask] = IGNORE_COLOR
+    return colors
 
 
 def load_ascii_ply_with_rgb(file_path: Path) -> Tuple[np.ndarray, np.ndarray]:
@@ -165,6 +257,20 @@ def load_ascii_ply_with_rgb(file_path: Path) -> Tuple[np.ndarray, np.ndarray]:
     return xyz, rgb
 
 
+def load_coord_and_labels(coord_path: Path, pred_path: Path, num_classes: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    points = np.load(coord_path)
+    labels = np.load(pred_path).reshape(-1).astype(np.int64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"coord.npy must have shape (N, 3), got: {points.shape}")
+    if points.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"coord.npy and pred.npy size mismatch: {points.shape[0]} vs {labels.shape[0]}"
+        )
+    palette = ensure_palette(max(num_classes, int(labels.max()) + 1 if labels.size else num_classes))
+    colors = labels_to_color(labels, palette)
+    return points.astype(np.float32), labels, colors
+
+
 def load_external_instance_ids(file_path: Path, expected_points: int) -> np.ndarray:
     suffix = file_path.suffix.lower()
     if suffix == ".npy":
@@ -201,6 +307,22 @@ def make_point_cloud(points: np.ndarray, colors: np.ndarray) -> "o3d.geometry.Po
     pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
     return pcd
+
+
+def group_by_labels(labels: np.ndarray) -> List[Dict[str, object]]:
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    groups: List[Dict[str, object]] = []
+    for label, count in sorted(zip(unique_labels.tolist(), counts.tolist()), key=lambda item: item[0]):
+        indices = np.flatnonzero(labels == label)
+        groups.append(
+            {
+                "name": f"label_{int(label):02d}",
+                "label": int(label),
+                "indices": indices,
+                "num_points": int(count),
+            }
+        )
+    return groups
 
 
 def group_by_color(colors: np.ndarray) -> List[Dict[str, object]]:
@@ -274,24 +396,17 @@ def run_lbc(point_cloud: "o3d.geometry.PointCloud", down_sample: float, verbose:
     return skeletonizer
 
 
-def infer_trunk_colors(color_groups: Sequence[Dict[str, object]]) -> List[RgbTuple]:
-    largest_group = max(color_groups, key=lambda group: int(group["num_points"]))
-    return [largest_group["color"]]  # type: ignore[list-item]
-
-
 def run_slbc(
     points: np.ndarray,
     colors: np.ndarray,
-    trunk_colors: Sequence[RgbTuple],
+    trunk_mask: np.ndarray,
     down_sample: float,
     verbose: bool = False,
 ):
     from pc_skeletor import SLBC
 
-    trunk_colors_array = np.asarray(trunk_colors, dtype=np.uint8)
-    matches = np.all(colors[:, None, :] == trunk_colors_array[None, :, :], axis=2)
-    trunk_mask = np.any(matches, axis=1)
-
+    if trunk_mask.shape[0] != points.shape[0]:
+        raise ValueError("SLBC trunk mask length does not match point count.")
     if not np.any(trunk_mask):
         raise ValueError("SLBC trunk selection is empty.")
     if np.all(trunk_mask):
@@ -313,11 +428,18 @@ def run_slbc(
     return skeletonizer
 
 
+def infer_largest_group(groups: Sequence[Dict[str, object]], key_name: str) -> object:
+    largest_group = max(groups, key=lambda group: int(group["num_points"]))
+    return largest_group[key_name]
+
+
 def summarize_group(group: Dict[str, object]) -> Dict[str, object]:
     summary = {
         "name": group["name"],
         "num_points": int(group["num_points"]),
     }
+    if "label" in group:
+        summary["label"] = int(group["label"])
     if "color" in group:
         summary["color"] = list(group["color"])  # type: ignore[arg-type]
     if "instance_id" in group:
@@ -325,26 +447,26 @@ def summarize_group(group: Dict[str, object]) -> Dict[str, object]:
     return summary
 
 
-def skeletonize_instances(
+def skeletonize_groups(
     points: np.ndarray,
     colors: np.ndarray,
     groups: Sequence[Dict[str, object]],
     output_root: Path,
-    input_ply: Path,
+    input_reference: Path,
     down_sample: float,
     min_points: int,
     verbose: bool,
 ) -> List[Dict[str, object]]:
     results: List[Dict[str, object]] = []
-    instances_root = output_root / "instances"
-    instances_root.mkdir(parents=True, exist_ok=True)
+    groups_root = output_root / "groups"
+    groups_root.mkdir(parents=True, exist_ok=True)
 
     for group in groups:
         result = summarize_group(group)
         indices = group["indices"]  # type: ignore[assignment]
-        instance_points = points[indices]
-        instance_colors = colors[indices]
-        result["output_dir"] = str((instances_root / str(group["name"])).resolve())
+        group_points = points[indices]
+        group_colors = colors[indices]
+        result["output_dir"] = str((groups_root / str(group["name"])).resolve())
         result["method"] = "lbc"
 
         if int(group["num_points"]) < min_points:
@@ -354,17 +476,17 @@ def skeletonize_instances(
             continue
 
         try:
-            instance_pcd = make_point_cloud(instance_points, instance_colors)
-            skeletonizer = run_lbc(instance_pcd, down_sample=down_sample, verbose=verbose)
-            output_dir = instances_root / str(group["name"])
+            group_pcd = make_point_cloud(group_points, group_colors)
+            skeletonizer = run_lbc(group_pcd, down_sample=down_sample, verbose=verbose)
+            output_dir = groups_root / str(group["name"])
             export_result_bundle(
                 output_dir=output_dir,
-                input_pcd=instance_pcd,
+                input_pcd=group_pcd,
                 skeletonizer=skeletonizer,
                 metadata={
                     **result,
                     "status": "ok",
-                    "input_file": str(input_ply.resolve()),
+                    "input_file": str(input_reference.resolve()),
                     "down_sample": down_sample,
                     "min_points": min_points,
                 },
@@ -373,7 +495,7 @@ def skeletonize_instances(
         except Exception as exc:  # pragma: no cover - integration behavior
             result["status"] = "failed"
             result["reason"] = str(exc)
-            logging.exception("Instance skeletonization failed for %s", group["name"])
+            logging.exception("Group skeletonization failed for %s", group["name"])
 
         results.append(result)
 
@@ -383,12 +505,12 @@ def skeletonize_instances(
 def skeletonize_full_cloud(
     points: np.ndarray,
     colors: np.ndarray,
-    color_groups: Sequence[Dict[str, object]],
     output_root: Path,
-    input_ply: Path,
+    input_reference: Path,
     method: str,
     down_sample: float,
-    trunk_colors: Optional[Sequence[RgbTuple]],
+    trunk_mask: Optional[np.ndarray],
+    trunk_info: Optional[Dict[str, object]],
     verbose: bool,
 ) -> Dict[str, object]:
     input_pcd = make_point_cloud(points, colors)
@@ -401,23 +523,18 @@ def skeletonize_full_cloud(
     }
 
     try:
-        trunk_strategy = None
         if method == "slbc":
-            if trunk_colors:
-                chosen_trunk_colors = list(trunk_colors)
-                trunk_strategy = "user_provided"
-            else:
-                chosen_trunk_colors = infer_trunk_colors(color_groups)
-                trunk_strategy = "largest_color_group"
+            if trunk_mask is None:
+                raise ValueError("SLBC requires trunk selection information.")
             skeletonizer = run_slbc(
                 points=points,
                 colors=colors,
-                trunk_colors=chosen_trunk_colors,
+                trunk_mask=trunk_mask,
                 down_sample=down_sample,
                 verbose=verbose,
             )
-            result["trunk_colors"] = [list(color) for color in chosen_trunk_colors]
-            result["trunk_strategy"] = trunk_strategy
+            if trunk_info:
+                result.update(trunk_info)
         else:
             skeletonizer = run_lbc(input_pcd, down_sample=down_sample, verbose=verbose)
 
@@ -428,7 +545,7 @@ def skeletonize_full_cloud(
             metadata={
                 **result,
                 "status": "ok",
-                "input_file": str(input_ply.resolve()),
+                "input_file": str(input_reference.resolve()),
                 "down_sample": down_sample,
             },
         )
@@ -439,6 +556,75 @@ def skeletonize_full_cloud(
         logging.exception("Full-cloud skeletonization failed")
 
     return result
+
+
+def build_trunk_selection(
+    method: str,
+    group_mode: str,
+    groups: Sequence[Dict[str, object]],
+    labels: Optional[np.ndarray],
+    colors: np.ndarray,
+    trunk_labels: Optional[Sequence[int]],
+    trunk_colors: Optional[Sequence[RgbTuple]],
+) -> Tuple[Optional[np.ndarray], Optional[Dict[str, object]]]:
+    if method != "slbc":
+        return None, None
+
+    if group_mode == "label" and labels is not None:
+        if trunk_labels:
+            chosen_labels = sorted(set(int(label) for label in trunk_labels))
+            mask = np.isin(labels, np.asarray(chosen_labels, dtype=np.int64))
+            info = {"trunk_labels": chosen_labels, "trunk_strategy": "user_provided_labels"}
+        else:
+            largest_label = int(infer_largest_group(groups, "label"))
+            mask = labels == largest_label
+            info = {"trunk_labels": [largest_label], "trunk_strategy": "largest_label_group"}
+        return mask, info
+
+    if trunk_colors:
+        chosen_colors = [parse_rgb_triplet(value) if isinstance(value, str) else value for value in trunk_colors]
+        color_array = np.asarray(chosen_colors, dtype=np.uint8)
+        mask = np.any(np.all(colors[:, None, :] == color_array[None, :, :], axis=2), axis=1)
+        info = {
+            "trunk_colors": [list(color) for color in chosen_colors],
+            "trunk_strategy": "user_provided_colors",
+        }
+        return mask, info
+
+    largest_color = infer_largest_group(group_by_color(colors), "color")
+    chosen_color = tuple(int(value) for value in largest_color)  # type: ignore[arg-type]
+    color_array = np.asarray(chosen_color, dtype=np.uint8)
+    mask = np.all(colors == color_array[None, :], axis=1)
+    info = {
+        "trunk_colors": [list(chosen_color)],
+        "trunk_strategy": "largest_color_group",
+    }
+    return mask, info
+
+
+def resolve_inputs(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Path]:
+    if args.group_mode == "label":
+        if args.coord_npy is None or args.pred_npy is None:
+            raise ValueError("--group-mode label requires both --coord-npy and --pred-npy")
+        if not args.coord_npy.exists():
+            raise FileNotFoundError(f"coord.npy not found: {args.coord_npy}")
+        if not args.pred_npy.exists():
+            raise FileNotFoundError(f"pred.npy not found: {args.pred_npy}")
+        points, labels, colors = load_coord_and_labels(
+            coord_path=args.coord_npy,
+            pred_path=args.pred_npy,
+            num_classes=args.num_classes,
+        )
+        return points, colors, labels, args.pred_npy
+
+    if args.input_ply is None:
+        raise ValueError(
+            f"--group-mode {args.group_mode} requires --input-ply unless label mode is used"
+        )
+    if not args.input_ply.exists():
+        raise FileNotFoundError(f"Input PLY not found: {args.input_ply}")
+    points, colors = load_ascii_ply_with_rgb(args.input_ply)
+    return points, colors, None, args.input_ply
 
 
 def write_summary(summary_path: Path, payload: Dict[str, object]) -> None:
@@ -453,34 +639,46 @@ def main() -> int:
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    if not args.input_ply.exists():
-        raise FileNotFoundError(f"Input PLY not found: {args.input_ply}")
+    if args.group_mode == "external_instance" and args.instance_file is None:
+        raise ValueError("--instance-file is required when --group-mode external_instance")
 
-    if args.instance_mode == "external_instance" and args.instance_file is None:
-        raise ValueError("--instance-file is required when --instance-mode external_instance")
+    points, colors, labels, input_reference = resolve_inputs(args)
 
-    points, colors = load_ascii_ply_with_rgb(args.input_ply)
-
-    if args.instance_mode == "color_label":
+    if args.group_mode == "label":
+        assert labels is not None
+        groups = group_by_labels(labels)
+    elif args.group_mode == "color_label":
         groups = group_by_color(colors)
     else:
         assert args.instance_file is not None
+        if not args.instance_file.exists():
+            raise FileNotFoundError(f"Instance file not found: {args.instance_file}")
         instance_ids = load_external_instance_ids(args.instance_file, expected_points=points.shape[0])
         groups = group_by_external_instances(instance_ids)
 
-    trunk_colors = None
+    parsed_trunk_colors = None
     if args.trunk_colors:
-        trunk_colors = [parse_rgb_triplet(value) for value in args.trunk_colors]
+        parsed_trunk_colors = [parse_rgb_triplet(value) for value in args.trunk_colors]
+
+    trunk_mask, trunk_info = build_trunk_selection(
+        method=args.method,
+        group_mode=args.group_mode,
+        groups=groups,
+        labels=labels,
+        colors=colors,
+        trunk_labels=args.trunk_labels,
+        trunk_colors=parsed_trunk_colors,
+    )
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    instance_results = skeletonize_instances(
+    group_results = skeletonize_groups(
         points=points,
         colors=colors,
         groups=groups,
         output_root=output_dir,
-        input_ply=args.input_ply,
+        input_reference=input_reference,
         down_sample=args.down_sample,
         min_points=args.min_points,
         verbose=args.verbose,
@@ -488,35 +686,38 @@ def main() -> int:
     full_result = skeletonize_full_cloud(
         points=points,
         colors=colors,
-        color_groups=group_by_color(colors),
         output_root=output_dir,
-        input_ply=args.input_ply,
+        input_reference=input_reference,
         method=args.method,
         down_sample=args.down_sample,
-        trunk_colors=trunk_colors,
+        trunk_mask=trunk_mask,
+        trunk_info=trunk_info,
         verbose=args.verbose,
     )
 
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "input_ply": str(args.input_ply.resolve()),
+        "input_reference": str(input_reference.resolve()),
+        "coord_npy": str(args.coord_npy.resolve()) if args.coord_npy else None,
+        "pred_npy": str(args.pred_npy.resolve()) if args.pred_npy else None,
+        "input_ply": str(args.input_ply.resolve()) if args.input_ply else None,
         "output_dir": str(output_dir),
-        "instance_mode": args.instance_mode,
+        "group_mode": args.group_mode,
         "instance_file": str(args.instance_file.resolve()) if args.instance_file else None,
         "method": args.method,
         "down_sample": args.down_sample,
         "min_points": args.min_points,
         "num_points": int(points.shape[0]),
-        "num_instances_discovered": len(groups),
-        "num_instances_ok": sum(result["status"] == "ok" for result in instance_results),
-        "num_instances_skipped": sum(result["status"] == "skipped" for result in instance_results),
-        "num_instances_failed": sum(result["status"] == "failed" for result in instance_results),
+        "num_groups_discovered": len(groups),
+        "num_groups_ok": sum(result["status"] == "ok" for result in group_results),
+        "num_groups_skipped": sum(result["status"] == "skipped" for result in group_results),
+        "num_groups_failed": sum(result["status"] == "failed" for result in group_results),
         "full": full_result,
-        "instances": instance_results,
+        "groups": group_results,
     }
     write_summary(output_dir / "summary.json", summary)
 
-    print(f"[INFO] Processed {len(groups)} instances from {args.input_ply}")
+    print(f"[INFO] Processed {len(groups)} groups from {input_reference}")
     print(f"[INFO] Summary written to {output_dir / 'summary.json'}")
     return 0
 
