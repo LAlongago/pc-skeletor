@@ -10,7 +10,9 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from skeletonize_pointcept_instances import (  # noqa: E402
+    adapt_graph_k,
     ensure_palette,
+    estimate_fps_points,
     group_by_color,
     group_by_labels,
     load_coord_and_labels,
@@ -109,3 +111,15 @@ def test_load_coord_and_labels_generates_palette_colors(tmp_path):
     np.testing.assert_array_equal(loaded_labels, labels)
     np.testing.assert_array_equal(colors[0], palette[0])
     np.testing.assert_array_equal(colors[1], palette[3])
+
+
+def test_estimate_fps_points_keeps_existing_floor():
+    assert estimate_fps_points(5) == 15
+    assert estimate_fps_points(150) == 15
+    assert estimate_fps_points(300) == 30
+
+
+def test_adapt_graph_k_avoids_equal_neighbor_and_sample_count():
+    assert adapt_graph_k(15, 15) == 14
+    assert adapt_graph_k(15, 30) == 15
+    assert adapt_graph_k(15, 2) == 1

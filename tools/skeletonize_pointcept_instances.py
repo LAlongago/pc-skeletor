@@ -161,6 +161,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable more detailed logging from this wrapper and pc-skeletor.",
     )
+    parser.add_argument(
+        "--extract-topology",
+        action="store_true",
+        help=(
+            "Also run pc-skeletor topology extraction and export topology files. "
+            "Disabled by default because many workflows only need skeleton.ply."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -309,6 +317,18 @@ def make_point_cloud(points: np.ndarray, colors: np.ndarray) -> "o3d.geometry.Po
     return pcd
 
 
+def estimate_fps_points(contracted_point_count: int) -> int:
+    if contracted_point_count <= 0:
+        return 0
+    return max(int(contracted_point_count * 0.1), 15)
+
+
+def adapt_graph_k(graph_k_n: int, fps_points: int) -> int:
+    if fps_points <= 1:
+        return 1
+    return max(1, min(int(graph_k_n), int(fps_points) - 1))
+
+
 def group_by_labels(labels: np.ndarray) -> List[Dict[str, object]]:
     unique_labels, counts = np.unique(labels, return_counts=True)
     groups: List[Dict[str, object]] = []
@@ -371,16 +391,23 @@ def export_result_bundle(
     output_dir.mkdir(parents=True, exist_ok=True)
     o3d.io.write_point_cloud(str(output_dir / "input_points.ply"), input_pcd)
     o3d.io.write_point_cloud(str(output_dir / "skeleton.ply"), skeletonizer.skeleton)
-    o3d.io.write_line_set(str(output_dir / "topology.ply"), skeletonizer.topology)
-    nx.write_gpickle(skeletonizer.skeleton_graph, str(output_dir / "skeleton_graph.gpickle"))
-    nx.write_gpickle(skeletonizer.topology_graph, str(output_dir / "topology_graph.gpickle"))
+    topology_status = metadata.get("topology_status", {})
+    if topology_status.get("status") == "ok":
+        o3d.io.write_line_set(str(output_dir / "topology.ply"), skeletonizer.topology)
+        nx.write_gpickle(skeletonizer.skeleton_graph, str(output_dir / "skeleton_graph.gpickle"))
+        nx.write_gpickle(skeletonizer.topology_graph, str(output_dir / "topology_graph.gpickle"))
     (output_dir / "meta.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
 
-def run_lbc(point_cloud: "o3d.geometry.PointCloud", down_sample: float, verbose: bool = False):
+def run_lbc(
+    point_cloud: "o3d.geometry.PointCloud",
+    down_sample: float,
+    verbose: bool = False,
+    extract_topology: bool = False,
+):
     from pc_skeletor import LBC
 
     skeletonizer = LBC(
@@ -392,8 +419,28 @@ def run_lbc(point_cloud: "o3d.geometry.PointCloud", down_sample: float, verbose:
         verbose=verbose,
     )
     skeletonizer.extract_skeleton()
-    skeletonizer.extract_topology()
-    return skeletonizer
+    contracted_point_count = int(np.asarray(skeletonizer.contracted_point_cloud.points).shape[0])
+    fps_points = estimate_fps_points(contracted_point_count)
+    adaptive_graph_k = adapt_graph_k(skeletonizer.graph_k_n, fps_points)
+    topology_status: Dict[str, object] = {
+        "status": "pending",
+        "contracted_point_count": contracted_point_count,
+        "fps_points": fps_points,
+        "graph_k_n": adaptive_graph_k,
+    }
+    if not extract_topology:
+        topology_status["status"] = "skipped"
+        topology_status["reason"] = "Topology extraction disabled."
+        return skeletonizer, topology_status
+    skeletonizer.graph_k_n = adaptive_graph_k
+    try:
+        skeletonizer.extract_topology()
+        topology_status["status"] = "ok"
+    except Exception as exc:
+        logging.warning("Topology extraction failed but skeleton extraction succeeded: %s", exc)
+        topology_status["status"] = "failed"
+        topology_status["reason"] = str(exc)
+    return skeletonizer, topology_status
 
 
 def run_slbc(
@@ -402,6 +449,7 @@ def run_slbc(
     trunk_mask: np.ndarray,
     down_sample: float,
     verbose: bool = False,
+    extract_topology: bool = False,
 ):
     from pc_skeletor import SLBC
 
@@ -424,8 +472,28 @@ def run_slbc(
         verbose=verbose,
     )
     skeletonizer.extract_skeleton()
-    skeletonizer.extract_topology()
-    return skeletonizer
+    contracted_point_count = int(np.asarray(skeletonizer.contracted_point_cloud.points).shape[0])
+    fps_points = estimate_fps_points(contracted_point_count)
+    adaptive_graph_k = adapt_graph_k(skeletonizer.graph_k_n, fps_points)
+    topology_status: Dict[str, object] = {
+        "status": "pending",
+        "contracted_point_count": contracted_point_count,
+        "fps_points": fps_points,
+        "graph_k_n": adaptive_graph_k,
+    }
+    if not extract_topology:
+        topology_status["status"] = "skipped"
+        topology_status["reason"] = "Topology extraction disabled."
+        return skeletonizer, topology_status
+    skeletonizer.graph_k_n = adaptive_graph_k
+    try:
+        skeletonizer.extract_topology()
+        topology_status["status"] = "ok"
+    except Exception as exc:
+        logging.warning("Topology extraction failed but skeleton extraction succeeded: %s", exc)
+        topology_status["status"] = "failed"
+        topology_status["reason"] = str(exc)
+    return skeletonizer, topology_status
 
 
 def infer_largest_group(groups: Sequence[Dict[str, object]], key_name: str) -> object:
@@ -456,6 +524,7 @@ def skeletonize_groups(
     down_sample: float,
     min_points: int,
     verbose: bool,
+    extract_topology: bool,
 ) -> List[Dict[str, object]]:
     results: List[Dict[str, object]] = []
     groups_root = output_root / "groups"
@@ -477,7 +546,12 @@ def skeletonize_groups(
 
         try:
             group_pcd = make_point_cloud(group_points, group_colors)
-            skeletonizer = run_lbc(group_pcd, down_sample=down_sample, verbose=verbose)
+            skeletonizer, topology_status = run_lbc(
+                group_pcd,
+                down_sample=down_sample,
+                verbose=verbose,
+                extract_topology=extract_topology,
+            )
             output_dir = groups_root / str(group["name"])
             export_result_bundle(
                 output_dir=output_dir,
@@ -486,12 +560,15 @@ def skeletonize_groups(
                 metadata={
                     **result,
                     "status": "ok",
+                    "topology_status": topology_status,
                     "input_file": str(input_reference.resolve()),
                     "down_sample": down_sample,
                     "min_points": min_points,
+                    "extract_topology": extract_topology,
                 },
             )
             result["status"] = "ok"
+            result["topology_status"] = topology_status
         except Exception as exc:  # pragma: no cover - integration behavior
             result["status"] = "failed"
             result["reason"] = str(exc)
@@ -512,6 +589,7 @@ def skeletonize_full_cloud(
     trunk_mask: Optional[np.ndarray],
     trunk_info: Optional[Dict[str, object]],
     verbose: bool,
+    extract_topology: bool,
 ) -> Dict[str, object]:
     input_pcd = make_point_cloud(points, colors)
     output_dir = output_root / "full"
@@ -532,11 +610,23 @@ def skeletonize_full_cloud(
                 trunk_mask=trunk_mask,
                 down_sample=down_sample,
                 verbose=verbose,
+                extract_topology=extract_topology,
             )
+            if isinstance(skeletonizer, tuple):
+                skeletonizer, topology_status = skeletonizer
+            else:  # pragma: no cover
+                topology_status = {"status": "unknown"}
+            result["topology_status"] = topology_status
             if trunk_info:
                 result.update(trunk_info)
         else:
-            skeletonizer = run_lbc(input_pcd, down_sample=down_sample, verbose=verbose)
+            skeletonizer, topology_status = run_lbc(
+                input_pcd,
+                down_sample=down_sample,
+                verbose=verbose,
+                extract_topology=extract_topology,
+            )
+            result["topology_status"] = topology_status
 
         export_result_bundle(
             output_dir=output_dir,
@@ -547,6 +637,7 @@ def skeletonize_full_cloud(
                 "status": "ok",
                 "input_file": str(input_reference.resolve()),
                 "down_sample": down_sample,
+                "extract_topology": extract_topology,
             },
         )
         result["status"] = "ok"
@@ -682,6 +773,7 @@ def main() -> int:
         down_sample=args.down_sample,
         min_points=args.min_points,
         verbose=args.verbose,
+        extract_topology=args.extract_topology,
     )
     full_result = skeletonize_full_cloud(
         points=points,
@@ -693,6 +785,7 @@ def main() -> int:
         trunk_mask=trunk_mask,
         trunk_info=trunk_info,
         verbose=args.verbose,
+        extract_topology=args.extract_topology,
     )
 
     summary = {
@@ -707,6 +800,7 @@ def main() -> int:
         "method": args.method,
         "down_sample": args.down_sample,
         "min_points": args.min_points,
+        "extract_topology": args.extract_topology,
         "num_points": int(points.shape[0]),
         "num_groups_discovered": len(groups),
         "num_groups_ok": sum(result["status"] == "ok" for result in group_results),
