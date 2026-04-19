@@ -49,6 +49,7 @@ class GraphComponentResult:
     polyline_length: float
     curve_length: float
     path_indices: List[int]
+    sampled_curve_points: np.ndarray
 
 
 PLY_TO_NUMPY = {
@@ -108,6 +109,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=True,
         help="Also compute length for the full skeleton.",
+    )
+    parser.add_argument(
+        "--export-visualizations",
+        action="store_true",
+        help="Export per-entry curve fitting visualizations as PLY assets.",
+    )
+    parser.add_argument(
+        "--visualization-dir",
+        type=Path,
+        default=None,
+        help="Optional output directory for visualization assets. Defaults to <skeleton-root>/curve_visualizations",
     )
     return parser.parse_args()
 
@@ -376,21 +388,20 @@ def polyline_length(points: np.ndarray) -> float:
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
 
 
-def spline_curve_length(
+def fit_curve_points(
     ordered_points: np.ndarray, resample_points: int, spline_smoothing: float
-) -> float:
+) -> np.ndarray:
     if ordered_points.shape[0] <= 1:
-        return 0.0
+        return ordered_points.astype(np.float64, copy=True)
     if ordered_points.shape[0] == 2:
-        return float(np.linalg.norm(ordered_points[1] - ordered_points[0]))
+        return ordered_points.astype(np.float64, copy=True)
 
-    base_length = polyline_length(ordered_points)
     if ordered_points.shape[0] < 4:
-        return base_length
+        return ordered_points.astype(np.float64, copy=True)
 
     chord = np.linalg.norm(np.diff(ordered_points, axis=0), axis=1)
     if np.allclose(chord.sum(), 0.0):
-        return 0.0
+        return ordered_points[:1].astype(np.float64, copy=True)
     u = np.concatenate(([0.0], np.cumsum(chord)))
     u /= u[-1]
 
@@ -405,10 +416,9 @@ def spline_curve_length(
             k=spline_degree,
         )
         sample_u = np.linspace(0.0, 1.0, max(int(resample_points), 2))
-        sampled = np.asarray(splev(sample_u, tck)).T
-        return polyline_length(sampled)
+        return np.asarray(splev(sample_u, tck)).T.astype(np.float64, copy=False)
     except Exception:
-        return base_length
+        return ordered_points.astype(np.float64, copy=True)
 
 
 def compute_component_curve_length(
@@ -438,9 +448,10 @@ def compute_component_curve_length(
     path_indices, _ = tree_diameter_path(node_indices, mst_edges, node_count=node_count)
     path_points = points[np.asarray(path_indices, dtype=np.int64)]
     line_length = polyline_length(path_points)
-    curve_length = spline_curve_length(
+    sampled_curve_points = fit_curve_points(
         path_points, resample_points=resample_points, spline_smoothing=spline_smoothing
     )
+    curve_length = polyline_length(sampled_curve_points)
     return GraphComponentResult(
         component_index=component_index,
         node_indices=[int(node) for node in node_indices],
@@ -450,27 +461,31 @@ def compute_component_curve_length(
         polyline_length=line_length,
         curve_length=curve_length,
         path_indices=[int(node) for node in path_indices],
+        sampled_curve_points=sampled_curve_points,
     )
 
 
-def analyze_skeleton_points(
+def analyze_skeleton_points_detailed(
     points: np.ndarray,
     k_neighbors: int,
     resample_points: int,
     spline_smoothing: float,
-) -> Dict[str, object]:
+) -> Tuple[Dict[str, object], List[GraphComponentResult]]:
     if points.shape[0] == 0:
-        return {
-            "num_skeleton_points": 0,
-            "component_count": 0,
-            "component_lengths": [],
-            "component_polyline_lengths": [],
-            "largest_component_length": 0.0,
-            "curve_length_sum": 0.0,
-            "polyline_length_sum": 0.0,
-            "had_cycle_before_cleanup": False,
-            "component_details": [],
-        }
+        return (
+            {
+                "num_skeleton_points": 0,
+                "component_count": 0,
+                "component_lengths": [],
+                "component_polyline_lengths": [],
+                "largest_component_length": 0.0,
+                "curve_length_sum": 0.0,
+                "polyline_length_sum": 0.0,
+                "had_cycle_before_cleanup": False,
+                "component_details": [],
+            },
+            [],
+        )
 
     edges = build_knn_edges(points, k_neighbors=k_neighbors)
     components = connected_components(points.shape[0], edges)
@@ -494,31 +509,182 @@ def analyze_skeleton_points(
 
     curve_lengths = [result.curve_length for result in component_results]
     polyline_lengths = [result.polyline_length for result in component_results]
-    return {
-        "num_skeleton_points": int(points.shape[0]),
-        "component_count": len(component_results),
-        "component_lengths": curve_lengths,
-        "component_polyline_lengths": polyline_lengths,
-        "largest_component_length": float(max(curve_lengths) if curve_lengths else 0.0),
-        "curve_length_sum": float(sum(curve_lengths)),
-        "polyline_length_sum": float(sum(polyline_lengths)),
-        "had_cycle_before_cleanup": bool(
-            any(result.had_cycle_before_cleanup for result in component_results)
-        ),
-        "component_details": [
+    return (
+        {
+            "num_skeleton_points": int(points.shape[0]),
+            "component_count": len(component_results),
+            "component_lengths": curve_lengths,
+            "component_polyline_lengths": polyline_lengths,
+            "largest_component_length": float(max(curve_lengths) if curve_lengths else 0.0),
+            "curve_length_sum": float(sum(curve_lengths)),
+            "polyline_length_sum": float(sum(polyline_lengths)),
+            "had_cycle_before_cleanup": bool(
+                any(result.had_cycle_before_cleanup for result in component_results)
+            ),
+            "component_details": [
+                {
+                    "component_index": result.component_index,
+                    "node_count": len(result.node_indices),
+                    "raw_edge_count": result.raw_edge_count,
+                    "mst_edge_count": result.mst_edge_count,
+                    "had_cycle_before_cleanup": result.had_cycle_before_cleanup,
+                    "polyline_length": result.polyline_length,
+                    "curve_length": result.curve_length,
+                    "path_node_count": len(result.path_indices),
+                    "curve_sample_count": int(result.sampled_curve_points.shape[0]),
+                }
+                for result in component_results
+            ],
+        },
+        component_results,
+    )
+
+
+def analyze_skeleton_points(
+    points: np.ndarray,
+    k_neighbors: int,
+    resample_points: int,
+    spline_smoothing: float,
+) -> Dict[str, object]:
+    metrics, _ = analyze_skeleton_points_detailed(
+        points,
+        k_neighbors=k_neighbors,
+        resample_points=resample_points,
+        spline_smoothing=spline_smoothing,
+    )
+    return metrics
+
+
+def write_ascii_point_ply(path: Path, points: np.ndarray, colors: Optional[np.ndarray] = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    points = np.asarray(points, dtype=np.float64)
+    if colors is None:
+        colors = np.tile(np.array([[255, 255, 255]], dtype=np.uint8), (points.shape[0], 1))
+    else:
+        colors = np.asarray(colors, dtype=np.uint8)
+        if colors.shape[0] != points.shape[0]:
+            raise ValueError("Color count must match point count for PLY export.")
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {points.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        for point, color in zip(points, colors):
+            f.write(
+                f"{float(point[0]):.9f} {float(point[1]):.9f} {float(point[2]):.9f} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+            )
+
+
+def write_ascii_polyline_ply(path: Path, points: np.ndarray, color: Tuple[int, int, int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    points = np.asarray(points, dtype=np.float64)
+    edge_count = max(points.shape[0] - 1, 0)
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {points.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write(f"element edge {edge_count}\n")
+        f.write("property int vertex1\n")
+        f.write("property int vertex2\n")
+        f.write("end_header\n")
+        for point in points:
+            f.write(
+                f"{float(point[0]):.9f} {float(point[1]):.9f} {float(point[2]):.9f} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+            )
+        for idx in range(edge_count):
+            f.write(f"{idx} {idx + 1}\n")
+
+
+def export_entry_visualization(
+    visualization_dir: Path,
+    entry_name: str,
+    points: np.ndarray,
+    component_results: Sequence[GraphComponentResult],
+) -> None:
+    entry_dir = visualization_dir / entry_name
+    entry_dir.mkdir(parents=True, exist_ok=True)
+
+    write_ascii_point_ply(
+        entry_dir / "skeleton_points.ply",
+        points,
+        colors=np.tile(np.array([[160, 160, 160]], dtype=np.uint8), (points.shape[0], 1)),
+    )
+
+    component_summaries = []
+    for component in component_results:
+        component_name = f"component_{component.component_index:02d}"
+        component_dir = entry_dir / component_name
+        path_points = points[np.asarray(component.path_indices, dtype=np.int64)]
+        write_ascii_point_ply(
+            component_dir / "path_points.ply",
+            path_points,
+            colors=np.tile(np.array([[255, 180, 0]], dtype=np.uint8), (path_points.shape[0], 1)),
+        )
+        write_ascii_polyline_ply(
+            component_dir / "path_polyline.ply",
+            path_points,
+            color=(255, 180, 0),
+        )
+        write_ascii_point_ply(
+            component_dir / "fitted_curve_points.ply",
+            component.sampled_curve_points,
+            colors=np.tile(np.array([[0, 200, 255]], dtype=np.uint8), (component.sampled_curve_points.shape[0], 1)),
+        )
+        write_ascii_polyline_ply(
+            component_dir / "fitted_curve_polyline.ply",
+            component.sampled_curve_points,
+            color=(0, 200, 255),
+        )
+        component_summaries.append(
             {
-                "component_index": result.component_index,
-                "node_count": len(result.node_indices),
-                "raw_edge_count": result.raw_edge_count,
-                "mst_edge_count": result.mst_edge_count,
-                "had_cycle_before_cleanup": result.had_cycle_before_cleanup,
-                "polyline_length": result.polyline_length,
-                "curve_length": result.curve_length,
-                "path_node_count": len(result.path_indices),
+                "component_index": component.component_index,
+                "path_point_count": len(component.path_indices),
+                "curve_sample_count": int(component.sampled_curve_points.shape[0]),
+                "polyline_length": component.polyline_length,
+                "curve_length": component.curve_length,
+                "had_cycle_before_cleanup": component.had_cycle_before_cleanup,
             }
-            for result in component_results
-        ],
-    }
+        )
+
+    (entry_dir / "visualization_meta.json").write_text(
+        json.dumps(
+            {
+                "entry_name": entry_name,
+                "num_skeleton_points": int(points.shape[0]),
+                "num_components": len(component_results),
+                "files": {
+                    "skeleton_points": "skeleton_points.ply",
+                    "per_component_path_points": "component_xx/path_points.ply",
+                    "per_component_path_polyline": "component_xx/path_polyline.ply",
+                    "per_component_fitted_curve_points": "component_xx/fitted_curve_points.ply",
+                    "per_component_fitted_curve_polyline": "component_xx/fitted_curve_polyline.ply",
+                },
+                "colors": {
+                    "skeleton_points": [160, 160, 160],
+                    "path": [255, 180, 0],
+                    "fitted_curve": [0, 200, 255],
+                },
+                "components": component_summaries,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
 
 def analyze_entry(
@@ -528,6 +694,7 @@ def analyze_entry(
     k_neighbors: int,
     resample_points: int,
     spline_smoothing: float,
+    visualization_dir: Optional[Path] = None,
 ) -> Dict[str, object]:
     result = {
         "scope": scope,
@@ -544,13 +711,21 @@ def analyze_entry(
 
     try:
         points = read_ply_points(skeleton_ply)
-        metrics = analyze_skeleton_points(
+        metrics, component_results = analyze_skeleton_points_detailed(
             points,
             k_neighbors=k_neighbors,
             resample_points=resample_points,
             spline_smoothing=spline_smoothing,
         )
         result.update(metrics)
+        if visualization_dir is not None:
+            export_entry_visualization(
+                visualization_dir=visualization_dir,
+                entry_name=str(result["name"]),
+                points=points,
+                component_results=component_results,
+            )
+            result["visualization_dir"] = str((visualization_dir / str(result["name"])).resolve())
         result["status"] = "ok"
     except Exception as exc:
         result["status"] = "analysis_failed"
@@ -626,6 +801,11 @@ def main() -> int:
         raise ValueError("summary.json does not contain a valid 'groups' list.")
 
     group_results = []
+    visualization_root = None
+    if args.export_visualizations:
+        visualization_root = default_output_path(
+            skeleton_root, "curve_visualizations", args.visualization_dir
+        )
     for entry in group_entries:
         output_dir = entry.get("output_dir")
         skeleton_ply = Path(output_dir) / "skeleton.ply" if output_dir else None
@@ -637,6 +817,7 @@ def main() -> int:
                 k_neighbors=args.k_neighbors,
                 resample_points=args.resample_points,
                 spline_smoothing=args.spline_smoothing,
+                visualization_dir=(visualization_root / "groups") if visualization_root else None,
             )
         )
 
@@ -653,6 +834,7 @@ def main() -> int:
             k_neighbors=args.k_neighbors,
             resample_points=args.resample_points,
             spline_smoothing=args.spline_smoothing,
+            visualization_dir=(visualization_root / "full") if visualization_root else None,
         )
 
     output_json = default_output_path(
@@ -669,6 +851,8 @@ def main() -> int:
         "k_neighbors": int(args.k_neighbors),
         "resample_points": int(args.resample_points),
         "spline_smoothing": float(args.spline_smoothing),
+        "export_visualizations": bool(args.export_visualizations),
+        "visualization_root": str(visualization_root.resolve()) if visualization_root else None,
         "full": full_result,
         "groups": group_results,
         "num_groups_total": len(group_results),

@@ -14,6 +14,7 @@ from compute_skeleton_curve_lengths import (  # noqa: E402
     analyze_entry,
     analyze_skeleton_points,
     compute_component_curve_length,
+    fit_curve_points,
     minimum_spanning_tree,
     read_ply_points,
     tree_diameter_path,
@@ -173,3 +174,43 @@ def test_analyze_entry_reads_realistic_temp_group(tmp_path):
     assert result["status"] == "ok"
     assert result["component_count"] == 1
     assert abs(result["curve_length_sum"] - 2.0) < 1e-6
+
+
+def test_fit_curve_points_falls_back_to_ordered_points_for_short_path():
+    points = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.2, 0.0], [2.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+
+    sampled = fit_curve_points(points, resample_points=50, spline_smoothing=0.0)
+
+    np.testing.assert_allclose(sampled, points)
+
+
+def test_analyze_entry_exports_visualization_assets(tmp_path):
+    group_dir = tmp_path / "label_01"
+    group_dir.mkdir()
+    skeleton_ply = group_dir / "skeleton.ply"
+    points = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    write_binary_point_ply(skeleton_ply, points)
+    entry = {"name": "label_01", "label": 1, "status": "ok"}
+    visualization_dir = tmp_path / "visualizations"
+
+    result = analyze_entry(
+        entry=entry,
+        scope="group",
+        skeleton_ply=skeleton_ply,
+        k_neighbors=1,
+        resample_points=20,
+        spline_smoothing=0.0,
+        visualization_dir=visualization_dir,
+    )
+
+    assert result["status"] == "ok"
+    assert (visualization_dir / "label_01" / "skeleton_points.ply").exists()
+    assert (visualization_dir / "label_01" / "component_00" / "path_polyline.ply").exists()
+    assert (visualization_dir / "label_01" / "component_00" / "fitted_curve_polyline.ply").exists()
+    assert "visualization_dir" in result
